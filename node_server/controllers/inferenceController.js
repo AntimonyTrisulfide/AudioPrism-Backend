@@ -7,6 +7,9 @@ import ProcessedStem from "../models/ProcessedStem.js";
 import dotenv from "dotenv";
 dotenv.config();
 
+const STEM_TTL_MINUTES = parseInt(process.env.STEM_TTL_MINUTES || "120", 10);
+const STEM_TTL_MS = Math.max(1, isNaN(STEM_TTL_MINUTES) ? 120 : STEM_TTL_MINUTES) * 60 * 1000;
+
 const computeFileHash = (filePath) => (
   new Promise((resolve, reject) => {
     const hash = crypto.createHash("sha256");
@@ -34,6 +37,22 @@ const persistUserOutput = async (userId, inputName, cacheId, stems) => {
   await user.save();
 };
 
+const pruneExpiredArtifacts = async (userId) => {
+  const cutoffDate = new Date(Date.now() - STEM_TTL_MS);
+  await ProcessedStem.deleteMany({ createdAt: { $lt: cutoffDate } });
+
+  if (!userId) {
+    return cutoffDate;
+  }
+
+  await User.updateOne(
+    { _id: userId },
+    { $pull: { savedOutputs: { createdAt: { $lt: cutoffDate } } } }
+  );
+
+  return cutoffDate;
+};
+
 const removeFileQuietly = (filePath) => {
   try {
     if (filePath && fs.existsSync(filePath)) {
@@ -56,7 +75,9 @@ export const runInference = async (req, res) => {
     const cacheId = await computeFileHash(tempFilePath);
 
     const cachedStem = await ProcessedStem.findOne({ cacheId });
-    if (cachedStem) {
+    if (cachedStem && cachedStem.createdAt < new Date(Date.now() - STEM_TTL_MS)) {
+      await ProcessedStem.deleteOne({ _id: cachedStem._id });
+    } else if (cachedStem) {
       const cachedStems = (cachedStem.stems && cachedStem.stems.length)
         ? cachedStem.stems
         : cachedStem.outputUrls.map((url, idx) => ({ name: `Stem ${idx + 1}`, url }));
@@ -137,13 +158,17 @@ export const getUserResults = async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const skip = (page - 1) * limit;
 
+    const cutoffDate = await pruneExpiredArtifacts(userId);
+
     const user = await User.findById(userId)
       .select("savedOutputs")
       .lean();
 
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    const sorted = [...user.savedOutputs].sort(
+    const freshOutputs = user.savedOutputs.filter((entry) => new Date(entry.createdAt) >= cutoffDate);
+
+    const sorted = [...freshOutputs].sort(
       (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
     );
 
